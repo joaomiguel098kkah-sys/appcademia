@@ -78,7 +78,7 @@ def init_db() -> bool:
                 nome TEXT NOT NULL,
                 series INTEGER NOT NULL CHECK (series > 0),
                 repeticoes TEXT NOT NULL,
-                carga REAL NOT NULL DEFAULT 0 CHECK (carga >= 0),
+                descanso TEXT NOT NULL DEFAULT '60s',
                 notas TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS app_migrations (
@@ -86,6 +86,35 @@ def init_db() -> bool:
             );
             """
         )
+
+        exercise_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(exercicios)")
+        }
+        if "descanso" not in exercise_columns:
+            connection.execute(
+                """
+                CREATE TABLE exercicios_novo (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    treino_id INTEGER NOT NULL
+                        REFERENCES treinos(id) ON DELETE CASCADE,
+                    nome TEXT NOT NULL,
+                    series INTEGER NOT NULL CHECK (series > 0),
+                    repeticoes TEXT NOT NULL,
+                    descanso TEXT NOT NULL DEFAULT '60s',
+                    notas TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO exercicios_novo
+                    (id, treino_id, nome, series, repeticoes, descanso, notas)
+                SELECT id, treino_id, nome, series, repeticoes, '60s', notas
+                FROM exercicios
+                """
+            )
+            connection.execute("DROP TABLE exercicios")
+            connection.execute("ALTER TABLE exercicios_novo RENAME TO exercicios")
 
         user_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(usuarios)")
@@ -122,8 +151,8 @@ def init_db() -> bool:
                 connection.execute(
                     """
                     INSERT OR IGNORE INTO exercicios
-                        (id, treino_id, nome, series, repeticoes, carga, notas)
-                    SELECT id, workout_id, name, sets, CAST(reps AS TEXT), weight, notes
+                        (id, treino_id, nome, series, repeticoes, descanso, notas)
+                    SELECT id, workout_id, name, sets, CAST(reps AS TEXT), '60s', notes
                     FROM exercises
                     """
                 )
@@ -329,7 +358,7 @@ def get_exercises(workout_id: int, user_id: int) -> list[sqlite3.Row]:
         return connection.execute(
             """
             SELECT exercicios.id, exercicios.nome, exercicios.series,
-                   exercicios.repeticoes, exercicios.carga, exercicios.notas
+                   exercicios.repeticoes, exercicios.descanso, exercicios.notas
             FROM exercicios
             JOIN treinos ON treinos.id = exercicios.treino_id
             WHERE exercicios.treino_id = ? AND treinos.usuario_id = ?
@@ -345,21 +374,102 @@ def create_exercise(
     name: str,
     sets: int,
     reps: str,
-    weight: float,
+    rest_time: str,
 ) -> None:
     with database_connection() as connection:
         connection.execute(
             """
             INSERT INTO exercicios
-                (treino_id, nome, series, repeticoes, carga)
+                (treino_id, nome, series, repeticoes, descanso)
             SELECT ?, ?, ?, ?, ?
             WHERE EXISTS (
                 SELECT 1 FROM treinos
                 WHERE id = ? AND usuario_id = ?
             )
             """,
-            (workout_id, name.strip(), sets, reps.strip(), weight, workout_id, user_id),
+            (
+                workout_id,
+                name.strip(),
+                sets,
+                reps.strip(),
+                rest_time.strip(),
+                workout_id,
+                user_id,
+            ),
         )
+
+
+def generate_smart_workout(focus: str, recovery: str) -> list[dict[str, str | int]]:
+    workouts = {
+        "Superiores": [
+            ("Supino com halteres", 3, "8-12", 90),
+            ("Remada sentada", 3, "8-12", 90),
+            ("Puxada na frente", 3, "10-12", 75),
+            ("Press de ombros na máquina", 2, "10-12", 75),
+            ("Supino inclinado na máquina", 2, "10-12", 75),
+        ],
+        "Inferiores": [
+            ("Leg press", 3, "8-12", 90),
+            ("Peso morto romeno com halteres", 3, "8-12", 90),
+            ("Agachamento goblet", 3, "10-12", 90),
+            ("Hip thrust", 2, "10-12", 75),
+            ("Subida para caixa (step-up)", 2, "10-12 por perna", 75),
+        ],
+        "Full body": [
+            ("Leg press", 3, "8-12", 90),
+            ("Supino com halteres", 3, "8-12", 90),
+            ("Remada sentada", 3, "8-12", 90),
+            ("Peso morto romeno com halteres", 2, "10-12", 90),
+            ("Puxada na frente", 2, "10-12", 75),
+        ],
+    }
+    exercises = workouts[focus]
+    low_recovery = recovery == "Baixa (menos volume)"
+    return [
+        {
+            "nome": name,
+            "series": max(1, sets - 1) if low_recovery else sets,
+            "repeticoes": reps,
+            "descanso": f"{rest + 30 if low_recovery else rest}s",
+        }
+        for name, sets, reps, rest in exercises
+    ]
+
+
+def save_smart_workout(
+    user_id: int,
+    name: str,
+    focus: str,
+    recovery: str,
+    exercises: list[dict[str, str | int]],
+) -> None:
+    notes = (
+        "Sugestão geral para perfil de 85 kg e 30% de gordura corporal; "
+        f"objetivo de perda de peso e recomposição corporal. Recuperação: {recovery}."
+    )
+    with database_connection() as connection:
+        workout = connection.execute(
+            """
+            INSERT INTO treinos (usuario_id, nome, divisao, notas)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, name.strip(), focus, notes),
+        )
+        for exercise in exercises:
+            connection.execute(
+                """
+                INSERT INTO exercicios
+                    (treino_id, nome, series, repeticoes, descanso)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    workout.lastrowid,
+                    exercise["nome"],
+                    exercise["series"],
+                    exercise["repeticoes"],
+                    exercise["descanso"],
+                ),
+            )
 
 
 def delete_exercise(exercise_id: int, workout_id: int, user_id: int) -> None:
@@ -503,7 +613,7 @@ def show_workout_cards(user_id: int) -> None:
                     st.caption(
                         f"{exercise['series']} séries  ·  "
                         f"{exercise['repeticoes']} repetições  ·  "
-                        f"{exercise['carga']:g} kg"
+                        f"{exercise['descanso']} de descanso"
                     )
                     if exercise["notas"]:
                         st.caption(exercise["notas"])
@@ -526,18 +636,22 @@ def show_workout_cards(user_id: int) -> None:
                 value="8-12",
                 help="Podes indicar um intervalo, por exemplo 8-12.",
             )
-            weight = st.number_input(
-                "Carga (kg)", min_value=0.0, value=0.0, step=0.5
+            rest_time = st.text_input(
+                "Tempo de descanso",
+                value="60s",
+                help="Indica a duração, por exemplo 60s ou 1min.",
             )
             submitted = st.form_submit_button(
                 "Adicionar exercício", type="primary", width="stretch"
             )
         if submitted:
-            if not name.strip() or not reps.strip():
-                st.error("Preenche o nome do exercício e as repetições.")
+            if not name.strip() or not reps.strip() or not rest_time.strip():
+                st.error(
+                    "Preenche o nome, as repetições e o tempo de descanso."
+                )
             else:
                 create_exercise(
-                    workout_id, user_id, name, int(sets), reps, float(weight)
+                    workout_id, user_id, name, int(sets), reps, rest_time
                 )
                 st.rerun()
 
@@ -583,6 +697,82 @@ def show_create_workout_form(user_id: int) -> None:
             create_workout(user_id, name, division, notes)
             st.success("Ficha de treino criada.")
             st.rerun()
+
+
+def show_smart_workout_generator(user_id: int) -> None:
+    st.subheader("Gerar Treino Inteligente")
+    st.caption(
+        "Sugestões para o perfil indicado: 85 kg, 30% de gordura corporal, "
+        "com foco em perda de peso e recomposição corporal."
+    )
+    st.info(
+        "A seleção prioriza movimentos multiarticulares e um volume moderado. "
+        "O peso e a percentagem de gordura, por si só, não determinam as cargas: "
+        "escolhe uma carga que permita executar cada repetição com boa técnica."
+    )
+    focus = st.selectbox(
+        "Foco do dia",
+        ["Superiores", "Inferiores", "Full body"],
+        key=f"smart_focus_{user_id}",
+    )
+    recovery = st.selectbox(
+        "Como está a tua recuperação?",
+        ["Normal", "Baixa (menos volume)"],
+        help=(
+            "Se ainda sentes fadiga do treino anterior, escolhe recuperação baixa "
+            "para reduzir séries e aumentar o descanso."
+        ),
+        key=f"smart_recovery_{user_id}",
+    )
+    if st.button(
+        "🤖 Gerar Treino Inteligente",
+        type="primary",
+        key=f"generate_smart_workout_{user_id}",
+        width="stretch",
+    ):
+        st.session_state[f"smart_workout_{user_id}"] = {
+            "focus": focus,
+            "recovery": recovery,
+            "exercises": generate_smart_workout(focus, recovery),
+        }
+
+    suggestion = st.session_state.get(f"smart_workout_{user_id}")
+    if not suggestion:
+        return
+    st.markdown(f"#### Sugestão: {suggestion['focus']}")
+    st.caption(
+        "Mantém 1–3 repetições em reserva e descansa o suficiente para "
+        "preservar a técnica. Ajusta ou interrompe qualquer movimento que cause dor."
+    )
+    for exercise in suggestion["exercises"]:
+        with st.container(border=True):
+            st.markdown(f"**{exercise['nome']}**")
+            st.caption(
+                f"{exercise['series']} séries · {exercise['repeticoes']} repetições "
+                f"· {exercise['descanso']} de descanso"
+            )
+
+    workout_name = st.text_input(
+        "Nome da ficha",
+        value=f"Treino Inteligente - {suggestion['focus']}",
+        key=f"smart_workout_name_{user_id}",
+    )
+    if st.button(
+        "Guardar nas minhas fichas",
+        key=f"save_smart_workout_{user_id}",
+        width="stretch",
+    ):
+        if not workout_name.strip():
+            st.error("Indica um nome para a ficha.")
+        else:
+            save_smart_workout(
+                user_id,
+                workout_name,
+                suggestion["focus"],
+                suggestion["recovery"],
+                suggestion["exercises"],
+            )
+            st.success("Treino inteligente guardado nas tuas fichas.")
 
 
 def show_admin_panel(admin_id: int) -> None:
@@ -746,10 +936,16 @@ else:
         show_admin_panel(current_user["id"])
     else:
         st.title("🏋️‍♂️ Meu Treino")
-        ficha_tab, create_tab = st.tabs(
-            ["📋 Fichas de Treino", "➕ Criar Novo Treino"]
+        ficha_tab, create_tab, smart_tab = st.tabs(
+            [
+                "📋 Fichas de Treino",
+                "➕ Criar Novo Treino",
+                "🤖 Treino Inteligente",
+            ]
         )
         with ficha_tab:
             show_workout_cards(current_user["id"])
         with create_tab:
             show_create_workout_form(current_user["id"])
+        with smart_tab:
+            show_smart_workout_generator(current_user["id"])
