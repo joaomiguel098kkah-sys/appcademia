@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Generator
+from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
@@ -170,6 +171,56 @@ SMART_WORKOUTS = {
         ("Crucifixo inverso", "isolado"),
     ],
 }
+
+SMART_WORKOUTS.update({
+    "Pernas Completo": SMART_WORKOUTS["Legs A"] + SMART_WORKOUTS["Legs B"][:2],
+    "Ombros": SMART_WORKOUTS["Ombros & Trapézio"],
+    "Braços": [
+        ("Curl de bíceps com halteres", "isolado"),
+        ("Curl de bíceps na polia", "isolado"),
+        ("Curl martelo", "isolado"),
+        ("Extensão de tríceps na polia", "isolado"),
+        ("Extensão de tríceps acima da cabeça", "isolado"),
+    ],
+    "Abdómen": [
+        ("Prancha", "abdomen"),
+        ("Dead bug", "abdomen"),
+        ("Mountain climbers", "hiit"),
+        ("Crunch na polia", "isolado"),
+    ],
+    "Peito": [
+        ("Supino reto com halteres", "multiarticular"),
+        ("Supino inclinado com halteres", "multiarticular"),
+        ("Flexões", "multiarticular"),
+        ("Crucifixo na polia", "isolado"),
+    ],
+    "Costas": [
+        ("Puxada na frente", "multiarticular"),
+        ("Remada sentada", "multiarticular"),
+        ("Remada unilateral com halter", "multiarticular"),
+        ("Remada baixa na polia", "multiarticular"),
+        ("Face pull", "isolado"),
+    ],
+})
+
+WEEKDAY_NAMES = (
+    "Segunda-feira",
+    "Terça-feira",
+    "Quarta-feira",
+    "Quinta-feira",
+    "Sexta-feira",
+    "Sábado",
+    "Domingo",
+)
+WEEKLY_WORKOUT_SCHEDULE = (
+    "Pull A",
+    "Push A",
+    "Legs A",
+    "Upper",
+    "Pull B",
+    "Legs B",
+    "Recuperação",
+)
 
 EXERCISE_GUIDES = {
     "puxada alta na barra": {
@@ -659,12 +710,32 @@ EXERCISE_GUIDES.update({
             "Regressa lentamente à posição inicial mantendo a tensão no abdómen.",
         ],
     },
+    "remada alta com halteres": {
+        "musculo": "Deltoide lateral e trapézio superior",
+        "equipamento": "Par de halteres leves",
+        "passos": [
+            "Fica de pé com os halteres à frente das coxas e os pés firmes no chão.",
+            "Mantém o tronco estável, os ombros relaxados e os cotovelos ligeiramente fletidos.",
+            "Eleva os halteres junto ao corpo apenas até uma amplitude confortável para os ombros.",
+            "Não forces os cotovelos acima da altura dos ombros nem uses balanço.",
+            "Baixa os halteres lentamente; interrompe se sentires dor no ombro.",
+        ],
+    },
+    "encolhimento de ombros com halteres": {
+        "musculo": "Trapézio superior",
+        "equipamento": "Par de halteres",
+        "passos": [
+            "Fica de pé com um halter em cada mão e os braços relaxados ao lado do corpo.",
+            "Mantém o pescoço neutro e os ombros afastados das orelhas na posição inicial.",
+            "Eleva os ombros em direção às orelhas sem rodar nem levar os ombros para a frente.",
+            "Faz uma pausa curta no topo sem enrijecer o pescoço.",
+            "Desce os ombros lentamente até à posição inicial.",
+        ],
+    },
 })
 
 EXERCISE_GUIDE_ALIASES = {
     "puxada com pega neutra": "puxada na frente",
-    "remada alta com halteres": "remada unilateral com halter",
-    "encolhimento de ombros com halteres": "press de ombros com halteres",
 }
 
 
@@ -738,6 +809,52 @@ def show_exercise_guide(exercise_name: str, muscle_group: str) -> None:
         st.markdown("**Execução passo a passo:**")
         for step_number, step in enumerate(guide["passos"], start=1):
             st.markdown(f"{step_number}. {step}")
+        try:
+            video_url = get_exercise_video_url(exercise_name)
+        except ValueError as error:
+            st.error(str(error))
+            video_url = None
+        if video_url:
+            st.video(video_url)
+        else:
+            st.caption(
+                "Vídeo de demonstração não configurado. Podes adicionar URLs "
+                "HTTPS na secção [exercise_videos] do Streamlit Secrets, usando "
+                "o nome do exercício sem acentos como chave."
+            )
+
+
+def get_exercise_video_url(exercise_name: str) -> str | None:
+    try:
+        configured_videos = st.secrets.get("exercise_videos", {})
+    except StreamlitSecretNotFoundError:
+        return None
+
+    normalized_name = normalize_exercise_name(exercise_name)
+    video_url = configured_videos.get(normalized_name)
+    if not video_url:
+        video_key = EXERCISE_GUIDE_ALIASES.get(
+            normalized_name, normalized_name
+        )
+        guide_name = next(
+            (
+                name for name in EXERCISE_GUIDES
+                if normalize_exercise_name(name) == video_key
+            ),
+            None,
+        )
+        if guide_name is not None:
+            video_url = configured_videos.get(
+                normalize_exercise_name(guide_name)
+            )
+    if not video_url:
+        return None
+
+    video_url = str(video_url).strip()
+    parsed_url = urlparse(video_url)
+    if parsed_url.scheme != "https" or not parsed_url.netloc:
+        raise ValueError("Os vídeos devem usar um URL HTTPS válido.")
+    return video_url
 
 
 def get_admin_password() -> str | None:
@@ -1579,6 +1696,7 @@ def save_smart_workout(
     exercises: list[dict[str, str | int]],
     cardio: str = "",
     cardio_position: str = "",
+    workout_date: str = "",
 ) -> None:
     notes = (
         f"Perfil: {profile_name} ({weight_kg:g} kg, "
@@ -1590,10 +1708,18 @@ def save_smart_workout(
         workout = connection.execute(
             """
             INSERT INTO treinos
-                (usuario_id, nome, divisao, notas, cardio, cardio_posicao)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (usuario_id, nome, divisao, data, notas, cardio, cardio_posicao)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, name.strip(), focus, notes, cardio, cardio_position),
+            (
+                user_id,
+                name.strip(),
+                focus,
+                workout_date,
+                notes,
+                cardio,
+                cardio_position,
+            ),
         )
         for exercise in exercises:
             connection.execute(
@@ -1611,6 +1737,20 @@ def save_smart_workout(
                     exercise["grupo_muscular"],
                 ),
             )
+
+
+def has_saved_smart_workout(user_id: int, workout_date: str, name: str) -> bool:
+    with database_connection() as connection:
+        return (
+            connection.execute(
+                """
+                SELECT 1 FROM treinos
+                WHERE usuario_id = ? AND data = ? AND nome = ?
+                """,
+                (user_id, workout_date, name),
+            ).fetchone()
+            is not None
+        )
 
 
 def delete_exercise(exercise_id: int, workout_id: int, user_id: int) -> None:
@@ -1888,13 +2028,14 @@ def show_workout_cards(user_id: int) -> None:
     else:
         for exercise in exercises:
             with st.container(border=True):
-                card, delete = st.columns([5, 1], vertical_alignment="center")
+                card, delete = st.columns([6, 1], vertical_alignment="top")
                 with card:
                     st.markdown(f"**{exercise['nome']}**")
-                    st.caption(
-                        f"{exercise['series']} séries  ·  "
-                        f"{exercise['repeticoes']} repetições  ·  "
-                        f"Descanso: {exercise['descanso']}"
+                    metrics = st.columns(3)
+                    metrics[0].metric("Séries", exercise["series"])
+                    metrics[1].metric("Repetições", exercise["repeticoes"])
+                    metrics[2].metric(
+                        "Tempo de descanso", exercise["descanso"]
                     )
                     if exercise["notas"]:
                         st.caption(exercise["notas"])
@@ -2008,6 +2149,211 @@ def show_create_workout_form(user_id: int) -> None:
                 cardio_position,
             )
             st.success("Ficha de treino criada.")
+            st.rerun()
+
+
+def get_weekly_workout_schedule(workouts_per_week: int) -> tuple[str, ...]:
+    schedules = {
+        1: ("Recuperação", "Recuperação", "Full Body", "Recuperação",
+            "Recuperação", "Recuperação", "Recuperação"),
+        2: ("Upper", "Recuperação", "Recuperação", "Lower",
+            "Recuperação", "Recuperação", "Recuperação"),
+        3: ("Pull A", "Recuperação", "Push A", "Recuperação",
+            "Legs A", "Recuperação", "Recuperação"),
+        4: ("Upper", "Lower", "Recuperação", "Upper",
+            "Lower", "Recuperação", "Recuperação"),
+        5: ("Pull A", "Push A", "Legs A", "Recuperação",
+            "Upper", "Lower", "Recuperação"),
+        6: WEEKLY_WORKOUT_SCHEDULE,
+        7: ("Pull A", "Push A", "Legs A", "Upper",
+            "Pull B", "Legs B", "Recuperação"),
+    }
+    try:
+        return schedules[workouts_per_week]
+    except KeyError as error:
+        raise ValueError("A meta semanal deve ser entre 1 e 7 treinos.") from error
+
+
+def get_daily_workout_suggestion(
+    now: datetime | None = None, workouts_per_week: int = 6
+) -> dict[str, str]:
+    current_time = now or datetime.now()
+    weekday = current_time.weekday()
+    return {
+        "weekday": WEEKDAY_NAMES[weekday],
+        "focus": get_weekly_workout_schedule(workouts_per_week)[weekday],
+        "date": current_time.date().isoformat(),
+    }
+
+
+def render_exercise_recommendations(
+    exercises: list[dict[str, str | int]],
+) -> None:
+    for exercise in exercises:
+        with st.container(border=True):
+            st.markdown(f"**{exercise['nome']}**")
+            metrics = st.columns(3)
+            metrics[0].metric("Séries", exercise["series"])
+            metrics[1].metric("Repetições", exercise["repeticoes"])
+            metrics[2].metric("Tempo de descanso", exercise["descanso"])
+            show_exercise_guide(
+                exercise["nome"],
+                str(exercise.get("grupo_muscular", "outros")),
+            )
+
+
+def show_daily_workout(user_id: int) -> None:
+    profile = get_training_profile(user_id)
+    workouts_per_week = int(profile["treinos_semana"]) if profile else 6
+    suggestion = get_daily_workout_suggestion(
+        workouts_per_week=workouts_per_week
+    )
+    st.subheader(f"Treino de hoje · {suggestion['weekday']}")
+    st.caption(
+        f"Plano semanal automático para {suggestion['date']}. "
+        "A data e o dia da semana são determinados pelo relógio local do servidor."
+    )
+    schedule_frame = pd.DataFrame(
+        [
+            {
+                "Dia": weekday,
+                "Sugestão": focus,
+                "Estado": "Recuperação" if focus == "Recuperação" else "Treino",
+            }
+            for weekday, focus in zip(
+                WEEKDAY_NAMES,
+                get_weekly_workout_schedule(workouts_per_week),
+            )
+        ]
+    )
+    st.dataframe(schedule_frame, width="stretch", hide_index=True)
+
+    focus = suggestion["focus"]
+    if focus == "Recuperação":
+        st.info(
+            "Hoje está reservado para recuperação. Podes fazer mobilidade leve "
+            "ou uma caminhada confortável, se isso fizer parte da tua rotina."
+        )
+        return
+    objective = str(profile["objetivo"]) if profile else "Perder peso"
+    weight_kg = float(profile["peso_kg"]) if profile else 85.0
+    body_fat = float(profile["gordura_percent"]) if profile else 30.0
+    exercises = generate_smart_workout(focus, objective, "Normal")
+    st.markdown(f"#### Plano sugerido: {focus}")
+    render_exercise_recommendations(exercises)
+
+    workout_name = f"{suggestion['date']} · {focus}"
+    already_saved = has_saved_smart_workout(
+        user_id, suggestion["date"], workout_name
+    )
+    if already_saved:
+        st.success("O treino de hoje já está guardado em Minhas Fichas.")
+    if st.button(
+        "📥 Carregar treino de hoje para Minhas Fichas",
+        type="primary",
+        disabled=already_saved,
+        key=f"load_daily_workout_{user_id}_{suggestion['date']}",
+        width="stretch",
+    ):
+        save_smart_workout(
+            user_id=user_id,
+            name=workout_name,
+            focus=focus,
+            profile_name=objective,
+            weight_kg=weight_kg,
+            body_fat_percent=body_fat,
+            recovery="Normal",
+            exercises=exercises,
+            workout_date=suggestion["date"],
+        )
+        st.rerun()
+
+
+def show_body_focus_generator(user_id: int) -> None:
+    profile = get_training_profile(user_id)
+    st.subheader("Gerar treino por grupo muscular")
+    if st.session_state.pop(f"body_focus_saved_{user_id}", False):
+        st.success("Treino focado guardado em Minhas Fichas.")
+    focus_options = [
+        "Pernas Completo",
+        "Ombros",
+        "Braços",
+        "Abdómen",
+        "Peito",
+        "Costas",
+        "Full Body",
+    ]
+    focus = st.selectbox(
+        "Escolhe a parte do corpo",
+        focus_options,
+        key=f"body_focus_{user_id}",
+    )
+    objective_options = list(TRAINING_PROFILES)
+    stored_objective = str(profile["objetivo"]) if profile else "Perder peso"
+    objective = st.selectbox(
+        "Objetivo",
+        objective_options,
+        index=(
+            objective_options.index(stored_objective)
+            if stored_objective in objective_options
+            else 0
+        ),
+        key=f"body_focus_objective_{user_id}",
+    )
+    recovery = st.selectbox(
+        "Recuperação",
+        ["Normal", "Baixa (menos volume)"],
+        key=f"body_focus_recovery_{user_id}",
+    )
+    state_key = f"body_focus_suggestion_{user_id}"
+    if st.button(
+        "Gerar treino focado",
+        type="primary",
+        key=f"generate_body_focus_{user_id}",
+        width="stretch",
+    ):
+        st.session_state[state_key] = {
+            "focus": focus,
+            "objective": objective,
+            "recovery": recovery,
+            "exercises": generate_smart_workout(
+                focus, objective, recovery
+            ),
+        }
+
+    suggestion = st.session_state.get(state_key)
+    if not suggestion:
+        return
+    st.markdown(f"#### {suggestion['focus']} · {suggestion['objective']}")
+    render_exercise_recommendations(suggestion["exercises"])
+    name = st.text_input(
+        "Nome da ficha",
+        value=f"Treino {suggestion['focus']}",
+        key=f"body_focus_name_{user_id}",
+    )
+    if st.button(
+        "Guardar treino focado",
+        key=f"save_body_focus_{user_id}",
+        width="stretch",
+    ):
+        if not name.strip():
+            st.error("Indica um nome para a ficha.")
+        else:
+            weight = float(profile["peso_kg"]) if profile else 85.0
+            body_fat = (
+                float(profile["gordura_percent"]) if profile else 30.0
+            )
+            save_smart_workout(
+                user_id,
+                name,
+                suggestion["focus"],
+                suggestion["objective"],
+                weight,
+                body_fat,
+                suggestion["recovery"],
+                suggestion["exercises"],
+            )
+            st.session_state[f"body_focus_saved_{user_id}"] = True
             st.rerun()
 
 
@@ -2504,17 +2850,31 @@ else:
             show_profile_form(current_user["id"], initial_setup=True)
             st.stop()
 
-        ficha_tab, create_tab, smart_tab, history_tab, profile_tab = st.tabs(
+        (
+            daily_tab,
+            ficha_tab,
+            body_tab,
+            create_tab,
+            smart_tab,
+            history_tab,
+            profile_tab,
+        ) = st.tabs(
             [
-                "📋 Meu Plano",
+                "📅 Treino de Hoje",
+                "📋 Minhas Fichas",
+                "🎯 Por Grupo Muscular",
                 "➕ Criar Novo Treino",
                 "🤖 Treino Inteligente",
                 "📈 Frequência e evolução",
                 "⚙️ Perfil e metas",
             ]
         )
+        with daily_tab:
+            show_daily_workout(current_user["id"])
         with ficha_tab:
             show_workout_cards(current_user["id"])
+        with body_tab:
+            show_body_focus_generator(current_user["id"])
         with create_tab:
             show_create_workout_form(current_user["id"])
         with smart_tab:
